@@ -479,9 +479,47 @@ const pauseHover = { btn: -1, confirm: -1 };
 const keys = {};
 const pressedOnce = {};
 window.addEventListener('keydown', e => {
+  if (gameState === 'MENU') {
+    if (['ArrowUp','ArrowDown','Enter','NumpadEnter','Space'].includes(e.code)) e.preventDefault();
+    if (e.code === 'ArrowUp' || e.code === 'ArrowDown') {
+      const btns = menuButtons();
+      const dir = e.code === 'ArrowUp' ? -1 : 1;
+      for (let k = 1; k < btns.length; k++){
+        const c = (menuNav.selectedIndex + dir*k + btns.length) % btns.length;
+        if (btns[c].enabled){ menuNav.selectedIndex = c; break; }
+      }
+    } else if (['Enter','NumpadEnter','Space'].includes(e.code)) {
+      const btns = menuButtons();
+      if (btns[menuNav.selectedIndex].enabled) doMenuBtn(menuNav.selectedIndex);
+    }
+    return;
+  }
+
+  if (gameState === 'PAUSED') {
+    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Enter','NumpadEnter','Space','Escape'].includes(e.code)) e.preventDefault();
+    if (e.code === 'Escape') {
+      gameState = 'PLAYING'; pauseNav.confirmRestart = false;
+    } else if (pauseNav.confirmRestart) {
+      if (e.code === 'ArrowLeft')  pauseNav.confirmIndex = 0;
+      if (e.code === 'ArrowRight') pauseNav.confirmIndex = 1;
+      if (['Enter','NumpadEnter','Space'].includes(e.code)) doConfirmBtn(pauseNav.confirmIndex);
+    } else {
+      if (e.code === 'ArrowUp')   pauseNav.selectedIndex = (pauseNav.selectedIndex + 2) % 3;
+      if (e.code === 'ArrowDown') pauseNav.selectedIndex = (pauseNav.selectedIndex + 1) % 3;
+      if (['Enter','NumpadEnter','Space'].includes(e.code)) doPauseBtn(pauseNav.selectedIndex);
+    }
+    return;
+  }
+
+  // PLAYING state
   if (!keys[e.code]) pressedOnce[e.code] = true;
   keys[e.code] = true;
-  if (['ArrowUp','ArrowLeft','ArrowRight','ArrowDown','Space','Escape','Enter','NumpadEnter'].includes(e.code)) e.preventDefault();
+  if (['ArrowUp','ArrowLeft','ArrowRight','ArrowDown','Space','Escape'].includes(e.code)) e.preventDefault();
+
+  if (e.code === 'Escape') {
+    if (player.peeing && player.peeSound){ sndPeeStop(player.peeSound); player.peeSound = null; player.peeing = false; }
+    gameState = 'PAUSED'; pauseNav.selectedIndex = 0; pauseNav.confirmRestart = false;
+  }
 });
 window.addEventListener('keyup', e => { keys[e.code] = false; });
 function consumePress(code){ const v = pressedOnce[code]; pressedOnce[code]=false; return v; }
@@ -2522,44 +2560,6 @@ function reset(){
 }
 
 function loop(){
-  // --- Клавиатурные переходы между состояниями ---
-  if (gameState === 'PLAYING') {
-    if (consumePress('Escape')) {
-      if (player.peeing && player.peeSound){
-        sndPeeStop(player.peeSound); player.peeSound = null; player.peeing = false;
-      }
-      gameState = 'PAUSED';
-      pauseNav.selectedIndex = 0;
-      pauseNav.confirmRestart = false;
-    }
-  } else if (gameState === 'PAUSED') {
-    if (consumePress('Escape')) { gameState = 'PLAYING'; pauseNav.confirmRestart = false; }
-    if (pauseNav.confirmRestart) {
-      if (consumePress('ArrowLeft'))  pauseNav.confirmIndex = 0;
-      if (consumePress('ArrowRight')) pauseNav.confirmIndex = 1;
-      if (consumePress('Enter') || consumePress('NumpadEnter')) doConfirmBtn(pauseNav.confirmIndex);
-    } else {
-      if (consumePress('ArrowUp'))   pauseNav.selectedIndex = (pauseNav.selectedIndex + 2) % 3;
-      if (consumePress('ArrowDown')) pauseNav.selectedIndex = (pauseNav.selectedIndex + 1) % 3;
-      if (consumePress('Enter') || consumePress('NumpadEnter')) doPauseBtn(pauseNav.selectedIndex);
-    }
-  } else if (gameState === 'MENU') {
-    const btns = menuButtons();
-    const upP = consumePress('ArrowUp'), downP = consumePress('ArrowDown');
-    if (upP || downP) {
-      const dir = upP ? -1 : 1;
-      let next = menuNav.selectedIndex;
-      for (let k = 1; k < btns.length; k++){
-        const c = (menuNav.selectedIndex + dir * k + btns.length) % btns.length;
-        if (btns[c].enabled){ next = c; break; }
-      }
-      menuNav.selectedIndex = next;
-    }
-    if (consumePress('Enter') || consumePress('NumpadEnter')) {
-      if (btns[menuNav.selectedIndex].enabled) doMenuBtn(menuNav.selectedIndex);
-    }
-  }
-
   // --- Обновление игры (только в PLAYING) ---
   if (gameState === 'PLAYING' && !player.dead){
     updatePlayer();
