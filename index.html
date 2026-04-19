@@ -896,7 +896,10 @@ function updatePlayer(){
   // Хитбокс атаки активен только в «ударной» фазе
   const totalAttackTime = player.attackType === 'scarf' ? 50 : 12;
   const elapsed = totalAttackTime - player.attackTimer;
-  const inHitFrame = player.attackType && elapsed >= (totalAttackTime - player.attackHitStart);
+  // fix: attackTimer > 0 required — when timer hits 0 the attack is over;
+  // without this check elapsed >= threshold is always true and the hitbox
+  // stays active permanently after the first attack.
+  const inHitFrame = player.attackType && player.attackTimer > 0 && elapsed >= (totalAttackTime - player.attackHitStart);
 
   // Звук хлыста шарфа в момент начала ударной фазы
   if (player.attackType === 'scarf' && elapsed === (totalAttackTime - player.attackHitStart)){
@@ -1140,14 +1143,17 @@ function updatePee(){
       continue;
     }
 
-    for (const e of enemies){
-      if (!e.alive) continue;
-      if (p.x >= e.x && p.x <= e.x + e.w && p.y >= e.y && p.y <= e.y + e.h){
-        // кислотный урон — медленный, требует удерживать поток
-        e.hp -= 0.04;
-        if (e.hp <= 0) e.alive = false;
-        pee.splice(i, 1);
-        break;
+    // fix: puke particles are a player debuff, not a weapon — skip enemy damage
+    if (!p.puke){
+      for (const e of enemies){
+        if (!e.alive) continue;
+        if (p.x >= e.x && p.x <= e.x + e.w && p.y >= e.y && p.y <= e.y + e.h){
+          // кислотный урон — медленный, требует удерживать поток
+          e.hp -= 0.04;
+          if (e.hp <= 0) e.alive = false;
+          pee.splice(i, 1);
+          break;
+        }
       }
     }
   }
@@ -2547,6 +2553,8 @@ function reset(){
   player.dead = false;
   player.invuln = 0;
   player.attackTimer = 0;
+  player.attackType = null;  // fix: stale attackType after restart kept hitbox permanently active
+  player.attackRange = 0;
   player.peeing = false;
   pee.length = 0;
   bottles.length = 0;
