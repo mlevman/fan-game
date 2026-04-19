@@ -1,0 +1,2361 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Фанат: Бродилка v2</title>
+<style>
+  body { margin:0; background:#0a0a0a; color:#fff; font-family: Arial, sans-serif; display:flex; flex-direction:column; align-items:center; padding:10px; }
+  canvas { background:#87CEEB; border:2px solid #333; display:block; }
+  .hud { margin-top:8px; font-size:14px; color:#ccc; text-align:center; max-width:900px; line-height:1.5; }
+  .hud b { color:#FFD400; }
+  #msg { margin-top:6px; color:#ff6; min-height:20px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="900" height="480"></canvas>
+<div class="hud">
+  <b>Движение:</b> ← → ↑ ↓ &nbsp;|&nbsp;
+  <b>Удары:</b> A — кулак, D — шарф &nbsp;|&nbsp;
+  <b>Моча:</b> S — струя &nbsp;|&nbsp;
+  <b>Бутылки:</b> E — выпить полную, Q — бросить пустую, F — наполнить мочой, T — бросить супер &nbsp;|&nbsp;
+  R — рестарт
+</div>
+<div style="margin-top: 8px; display: flex; gap: 12px; align-items: center; font-size: 13px; color: #ccc; flex-wrap: wrap;">
+  <button id="muteBtn" style="background:#222;color:#FFD400;border:1px solid #444;padding:6px 14px;cursor:pointer;font-size:13px;border-radius:3px;">🔊 Звук ВКЛ</button>
+  <label>SFX <input id="sfxVol" type="range" min="0" max="100" value="60" style="vertical-align:middle;"></label>
+  <label>Музыка <input id="musicVol" type="range" min="0" max="100" value="25" style="vertical-align:middle;"></label>
+  <button id="musicBtn" style="background:#222;color:#FFD400;border:1px solid #444;padding:6px 14px;cursor:pointer;font-size:13px;border-radius:3px;">🎵 Музыка ВКЛ</button>
+</div>
+<div id="msg"></div>
+
+<script>
+// =============================================================
+// ЗВУКОВАЯ СИСТЕМА (Web Audio API, синтез без внешних файлов)
+// =============================================================
+const SFX = {
+  ctx: null,
+  masterGain: null,
+  sfxGain: null,
+  musicGain: null,
+  enabled: true,
+  musicOn: true,
+  sfxVolume: 0.6,
+  musicVolume: 0.25,
+  musicTimer: 0,
+  musicStep: 0,
+  musicPattern: null,
+  started: false,
+};
+
+function initAudio(){
+  if (SFX.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  SFX.ctx = new AC();
+  SFX.masterGain = SFX.ctx.createGain();
+  SFX.masterGain.gain.value = 1;
+  SFX.masterGain.connect(SFX.ctx.destination);
+
+  SFX.sfxGain = SFX.ctx.createGain();
+  SFX.sfxGain.gain.value = SFX.sfxVolume;
+  SFX.sfxGain.connect(SFX.masterGain);
+
+  SFX.musicGain = SFX.ctx.createGain();
+  SFX.musicGain.gain.value = SFX.musicVolume;
+  SFX.musicGain.connect(SFX.masterGain);
+}
+
+// безопасный запуск контекста (браузеры требуют interaction)
+function ensureAudio(){
+  initAudio();
+  if (SFX.ctx.state === 'suspended') SFX.ctx.resume();
+  SFX.started = true;
+}
+
+// Осциллятор-тон
+function playTone(freq, dur, type='square', vol=0.3, attack=0.005, release=0.05, freqEnd=null){
+  if (!SFX.enabled || !SFX.ctx) return;
+  const t = SFX.ctx.currentTime;
+  const osc = SFX.ctx.createOscillator();
+  const g = SFX.ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (freqEnd !== null){
+    osc.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 0.01), t + dur);
+  }
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vol, t + attack);
+  g.gain.linearRampToValueAtTime(0, t + dur - release > t + attack ? t + dur : t + dur + 0.01);
+  osc.connect(g);
+  g.connect(SFX.sfxGain);
+  osc.start(t);
+  osc.stop(t + dur + 0.05);
+}
+
+// Шум (для струи, взрывов, разбитого стекла)
+function playNoise(dur, vol=0.3, filterFreq=2000, filterQ=1, filterType='bandpass', freqEnd=null){
+  if (!SFX.enabled || !SFX.ctx) return;
+  const t = SFX.ctx.currentTime;
+  const bufferSize = Math.ceil(SFX.ctx.sampleRate * dur);
+  const buffer = SFX.ctx.createBuffer(1, bufferSize, SFX.ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+  const src = SFX.ctx.createBufferSource();
+  src.buffer = buffer;
+  const filter = SFX.ctx.createBiquadFilter();
+  filter.type = filterType;
+  filter.frequency.setValueAtTime(filterFreq, t);
+  filter.Q.value = filterQ;
+  if (freqEnd !== null){
+    filter.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 0.01), t + dur);
+  }
+  const g = SFX.ctx.createGain();
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(SFX.sfxGain);
+  src.start(t);
+  src.stop(t + dur + 0.05);
+}
+
+// --- Конкретные звуки ---
+
+function sndPunch(){
+  // Низкий короткий удар: нисходящий тон + шумовой щелчок
+  playTone(180, 0.08, 'square', 0.35, 0.002, 0.02, 60);
+  playNoise(0.05, 0.3, 800, 3, 'lowpass');
+}
+
+function sndScarfSwing(){
+  // Свист раскрутки шарфа
+  playNoise(0.4, 0.15, 2500, 8, 'bandpass', 800);
+}
+
+function sndScarfHit(){
+  // Хлыст — свист + резкий удар
+  playNoise(0.1, 0.35, 4000, 5, 'bandpass', 1200);
+  playTone(120, 0.12, 'sawtooth', 0.3, 0.002, 0.03, 50);
+}
+
+function sndJump(){
+  // Восходящий писк
+  playTone(300, 0.18, 'square', 0.18, 0.005, 0.05, 650);
+}
+
+function sndStomp(){
+  // Смачный шлепок: низкий тон + шум
+  playTone(90, 0.1, 'square', 0.35, 0.002, 0.03, 50);
+  playNoise(0.1, 0.25, 400, 2, 'lowpass');
+}
+
+function sndHurt(){
+  // Нисходящий «ой»: два тона вместе
+  playTone(420, 0.2, 'triangle', 0.3, 0.005, 0.05, 180);
+  playTone(210, 0.2, 'sawtooth', 0.15, 0.005, 0.05, 90);
+}
+
+function sndPickupBeer(){
+  // Приятный «дзынь» из двух нот
+  playTone(880, 0.1, 'triangle', 0.25, 0.005, 0.05);
+  setTimeout(() => playTone(1320, 0.15, 'triangle', 0.25, 0.005, 0.05), 70);
+}
+
+function sndDrinkBeer(){
+  // «Буль-буль» — цепочка низких квазислучайных тонов
+  const freqs = [160, 140, 180, 150, 170];
+  freqs.forEach((f, i) => {
+    setTimeout(() => playTone(f, 0.08, 'sine', 0.25, 0.01, 0.02), i * 70);
+  });
+  // финальное «ах»
+  setTimeout(() => playTone(350, 0.2, 'triangle', 0.2, 0.02, 0.1, 200), 400);
+}
+
+function sndFillBottle(){
+  // Долгое «журчание» в бутылку — шум с волнообразной модуляцией
+  playNoise(2.4, 0.18, 1800, 4, 'bandpass', 900);
+  // серия мелких «бульков»
+  for (let i = 0; i < 12; i++){
+    setTimeout(() => playTone(180 + Math.random()*60, 0.05, 'sine', 0.15, 0.005, 0.01), i * 200);
+  }
+}
+
+function sndFillDone(){
+  // Завершение наполнения: «тада!»
+  playTone(440, 0.08, 'square', 0.25, 0.005, 0.02);
+  setTimeout(() => playTone(660, 0.08, 'square', 0.25, 0.005, 0.02), 80);
+  setTimeout(() => playTone(880, 0.2, 'square', 0.3, 0.005, 0.05), 160);
+}
+
+function sndThrow(){
+  // Свист броска
+  playNoise(0.25, 0.12, 3500, 8, 'bandpass', 1200);
+}
+
+function sndBottleBreak(){
+  // Разбитое стекло: высокочастотный шум + щелчки
+  playNoise(0.25, 0.35, 6000, 3, 'highpass');
+  for (let i = 0; i < 4; i++){
+    setTimeout(() => playTone(3000 + Math.random()*2000, 0.04, 'triangle', 0.15, 0.002, 0.01), i * 40);
+  }
+}
+
+function sndExplosion(){
+  // Супер-граната: мощный басовый удар + длинный хвост шума
+  playTone(70, 0.4, 'sawtooth', 0.4, 0.002, 0.1, 30);
+  playNoise(0.6, 0.45, 600, 1, 'lowpass', 100);
+  playNoise(0.4, 0.25, 3000, 2, 'bandpass');
+}
+
+function sndPeeStream(){
+  // Непрерывный шум струи — но тихий и мягкий
+  // Управляется отдельно (старт/стоп), чтобы не спамить кадрами
+  if (!SFX.enabled || !SFX.ctx) return null;
+  const t = SFX.ctx.currentTime;
+  const bufferSize = Math.ceil(SFX.ctx.sampleRate * 0.5);
+  const buffer = SFX.ctx.createBuffer(1, bufferSize, SFX.ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+  const src = SFX.ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  const filter = SFX.ctx.createBiquadFilter();
+  filter.type = 'bandpass';
+  filter.frequency.value = 2200;
+  filter.Q.value = 3;
+  const g = SFX.ctx.createGain();
+  g.gain.value = 0;
+  g.gain.linearRampToValueAtTime(0.12, t + 0.05);
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(SFX.sfxGain);
+  src.start(t);
+  return {src, g};
+}
+function sndPeeStop(node){
+  if (!node || !SFX.ctx) return;
+  const t = SFX.ctx.currentTime;
+  node.g.gain.cancelScheduledValues(t);
+  node.g.gain.linearRampToValueAtTime(0, t + 0.05);
+  setTimeout(() => { try { node.src.stop(); } catch(e){} }, 100);
+}
+
+function sndEnemyDeath(){
+  // Падающий писк
+  playTone(280, 0.25, 'sawtooth', 0.25, 0.005, 0.05, 90);
+}
+
+function sndVictory(){
+  // Мажорная фанфара
+  const notes = [523, 659, 784, 1047]; // C E G C
+  notes.forEach((f, i) => {
+    setTimeout(() => playTone(f, 0.2, 'square', 0.3, 0.01, 0.05), i * 120);
+  });
+}
+
+function sndDefeat(){
+  // Минорная нисходящая
+  const notes = [440, 392, 349, 294];
+  notes.forEach((f, i) => {
+    setTimeout(() => playTone(f, 0.25, 'sawtooth', 0.3, 0.01, 0.05), i * 180);
+  });
+}
+
+// =============================================================
+// ФОНОВАЯ МУЗЫКА — простой зацикленный 8-битный бас-паттерн
+// =============================================================
+function setupMusic(){
+  // Паттерн в ля-миноре, 16 шагов
+  // Каждый шаг ~0.2 сек (BPM ~ 150, 1/8)
+  // null = пауза
+  SFX.musicPattern = {
+    bass:  [55, null, 55, null, 73, null, 55, null, 65, null, 65, null, 73, null, 55, null], // A1, D2, E2
+    lead:  [null, 440, null, 523, null, 659, null, 587, null, 440, null, 392, null, 523, null, 330],
+    drum:  [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 0, 1, 0],
+  };
+}
+
+function playMusicStep(){
+  if (!SFX.musicOn || !SFX.enabled || !SFX.ctx) return;
+  const p = SFX.musicPattern;
+  const step = SFX.musicStep;
+
+  // бас
+  const bassF = p.bass[step];
+  if (bassF !== null){
+    playMusicNote(bassF, 0.18, 'triangle', 0.5);
+  }
+  // лид
+  const leadF = p.lead[step];
+  if (leadF !== null){
+    playMusicNote(leadF, 0.1, 'square', 0.15);
+  }
+  // удар
+  if (p.drum[step]){
+    playMusicDrum();
+  }
+
+  SFX.musicStep = (SFX.musicStep + 1) % p.bass.length;
+}
+
+function playMusicNote(freq, dur, type, vol){
+  if (!SFX.ctx) return;
+  const t = SFX.ctx.currentTime;
+  const osc = SFX.ctx.createOscillator();
+  const g = SFX.ctx.createGain();
+  osc.type = type;
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.01);
+  g.gain.linearRampToValueAtTime(0, t + dur);
+  osc.connect(g);
+  g.connect(SFX.musicGain);
+  osc.start(t);
+  osc.stop(t + dur + 0.05);
+}
+
+function playMusicDrum(){
+  if (!SFX.ctx) return;
+  const t = SFX.ctx.currentTime;
+  const bufferSize = Math.ceil(SFX.ctx.sampleRate * 0.08);
+  const buffer = SFX.ctx.createBuffer(1, bufferSize, SFX.ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = (Math.random() * 2 - 1) * (1 - i/bufferSize);
+  const src = SFX.ctx.createBufferSource();
+  src.buffer = buffer;
+  const filter = SFX.ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 180;
+  const g = SFX.ctx.createGain();
+  g.gain.value = 0.4;
+  src.connect(filter);
+  filter.connect(g);
+  g.connect(SFX.musicGain);
+  src.start(t);
+  src.stop(t + 0.1);
+}
+
+// Управление
+document.addEventListener('DOMContentLoaded', () => {
+  const muteBtn = document.getElementById('muteBtn');
+  const musicBtn = document.getElementById('musicBtn');
+  const sfxVol = document.getElementById('sfxVol');
+  const musicVol = document.getElementById('musicVol');
+
+  muteBtn.addEventListener('click', () => {
+    ensureAudio();
+    SFX.enabled = !SFX.enabled;
+    muteBtn.textContent = SFX.enabled ? '🔊 Звук ВКЛ' : '🔇 Звук ВЫКЛ';
+    if (SFX.masterGain) SFX.masterGain.gain.value = SFX.enabled ? 1 : 0;
+  });
+
+  musicBtn.addEventListener('click', () => {
+    ensureAudio();
+    SFX.musicOn = !SFX.musicOn;
+    musicBtn.textContent = SFX.musicOn ? '🎵 Музыка ВКЛ' : '🎵 Музыка ВЫКЛ';
+  });
+
+  sfxVol.addEventListener('input', () => {
+    SFX.sfxVolume = sfxVol.value / 100;
+    if (SFX.sfxGain) SFX.sfxGain.gain.value = SFX.sfxVolume;
+  });
+  musicVol.addEventListener('input', () => {
+    SFX.musicVolume = musicVol.value / 100;
+    if (SFX.musicGain) SFX.musicGain.gain.value = SFX.musicVolume;
+  });
+
+  setupMusic();
+});
+
+// Инициализация аудио при первом же пользовательском действии
+window.addEventListener('keydown', () => ensureAudio(), {once: true});
+window.addEventListener('click', () => ensureAudio(), {once: true});
+window.addEventListener('touchstart', () => ensureAudio(), {once: true});
+
+// =============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const msgEl = document.getElementById('msg');
+
+const GROUND_Y = H - 60;
+const GRAVITY = 0.7;
+const LEVEL_WIDTH = 4800;
+
+const platforms = [
+  [0, GROUND_Y, LEVEL_WIDTH, 60],
+  [350, 360, 120, 18],
+  [550, 280, 120, 18],
+  [780, 340, 100, 18],
+  [1050, 300, 140, 18],
+  [1280, 360, 100, 18],
+  [1500, 260, 160, 18],
+  [1800, 320, 120, 18],
+  [2050, 360, 100, 18],
+  [2250, 280, 140, 18],
+  [2500, 340, 120, 18],
+  [2800, 300, 160, 18],
+  [3100, 360, 100, 18],
+  [3350, 260, 140, 18],
+  [3650, 320, 120, 18],
+  [3950, 300, 140, 18],
+  [4250, 340, 160, 18],
+];
+
+const player = {
+  x: 80, y: GROUND_Y - 64, w: 34, h: 64,
+  vx: 0, vy: 0, onGround: false,
+  hp: 5, maxHp: 5,
+  fullBeers: 0,      // полные бутылки пива (только выпить)
+  emptyBottles: 0,   // пустые бутылки (бросить или наполнить мочой)
+  superBottles: 0,   // супер-бутылки с мочой (только бросить)
+  pukeTimer: 0,      // блевание после безалкогольного пива
+  pukeTotal: 120,    // 2 секунды парализации
+  peeTank: 0,
+  peeTankMax: 600,
+  peeSegments: [],
+  facing: 1,
+  crouch: false,
+  attackTimer: 0, attackType: null, attackRange: 0,
+  peeing: false,
+  fillingTimer: 0,
+  fillingTotal: 150,
+  invuln: 0,
+  dead: false,
+  walkPhase: 0,
+  scarfWave: 0,
+  scarfLift: 0,
+};
+
+const PEE_PER_BEER_FRAMES = 180;
+const FILL_PEE_COST = 90;   // 1.5 сек бака для супер-наполнения
+
+const pee = [];
+const bottles = [];    // летящие бутылки {x,y,vx,vy,rot,super:bool,life}
+const splashes = [];   // взрывы/брызги {x,y,r,maxR,life,maxLife}
+const peeSplatters = []; // лужи от взрыва (кислота на земле) {x,y,w,life,damage}
+
+const enemies = [];
+function spawnEnemy(x, type) {
+  enemies.push({
+    x, y: GROUND_Y - 60, w: 36, h: 60,
+    vx: 0, vy: 0, onGround: false,
+    hp: type === 'shield' ? 3 : 2,
+    maxHp: type === 'shield' ? 3 : 2,
+    type, facing: -1,
+    attackCd: 0, hitCd: 0,
+    alive: true,
+    walkPhase: 0,
+  });
+}
+[400, 700, 950, 1200, 1450, 1700, 2000, 2300, 2600, 2900, 3200, 3500, 3800, 4100, 4400].forEach((x,i)=>{
+  spawnEnemy(x, i%2===0 ? 'baton' : 'shield');
+});
+
+const beers = [];
+// nonAlco: синяя безалкогольная — урон/блевание вместо пользы
+function spawnBeer(x, y, nonAlco = false){
+  beers.push({x, y, w:22, h:42, taken:false, bob:Math.random()*Math.PI*2, nonAlco});
+}
+// Индексы 3 и 9 — безалкогольные (из 13 = ~15%)
+const NON_ALCO_INDICES = new Set([3, 9]);
+[300, 600, 900, 1350, 1650, 1950, 2400, 2750, 3050, 3400, 3700, 4000, 4350].forEach((x,i)=>{
+  spawnBeer(x, GROUND_Y - 48 - (i%3)*40, NON_ALCO_INDICES.has(i));
+});
+
+let camX = 0;
+
+const keys = {};
+const pressedOnce = {};
+window.addEventListener('keydown', e => {
+  if (!keys[e.code]) pressedOnce[e.code] = true;
+  keys[e.code] = true;
+  if (['ArrowUp','ArrowLeft','ArrowRight','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+});
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+function consumePress(code){ const v = pressedOnce[code]; pressedOnce[code]=false; return v; }
+
+function rectsOverlap(a,b){
+  return a.x < b.x+b.w && a.x+a.w > b.x && a.y < b.y+b.h && a.y+a.h > b.y;
+}
+
+function resolvePlatformCollision(obj){
+  obj.onGround = false;
+  for (const p of platforms){
+    const pr = {x:p[0], y:p[1], w:p[2], h:p[3]};
+    if (rectsOverlap(obj, pr)){
+      const overlapL = (obj.x + obj.w) - pr.x;
+      const overlapR = (pr.x + pr.w) - obj.x;
+      const overlapT = (obj.y + obj.h) - pr.y;
+      const overlapB = (pr.y + pr.h) - obj.y;
+      const minOv = Math.min(overlapL, overlapR, overlapT, overlapB);
+      if (minOv === overlapT && obj.vy >= 0){
+        obj.y = pr.y - obj.h; obj.vy = 0; obj.onGround = true;
+      } else if (minOv === overlapB && obj.vy < 0){
+        obj.y = pr.y + pr.h; obj.vy = 0;
+      } else if (minOv === overlapL && obj.vx > 0){
+        obj.x = pr.x - obj.w; obj.vx = 0;
+      } else if (minOv === overlapR && obj.vx < 0){
+        obj.x = pr.x + pr.w; obj.vx = 0;
+      }
+    }
+  }
+}
+
+function updatePlayer(){
+  if (player.dead) return;
+
+  // --- Блевание после безалкогольного: полная парализация ---
+  if (player.pukeTimer > 0){
+    player.pukeTimer--;
+    player.vx = 0;
+    player.vy += GRAVITY;
+    if (player.vy > 18) player.vy = 18;
+    resolvePlatformCollision(player);
+    player.y += player.vy;
+    resolvePlatformCollision(player);
+    if (player.invuln > 0) player.invuln--;
+    // эмитим частицы блевотины из рта
+    if (player.pukeTimer % 3 === 0){
+      const px = player.x + (player.facing === 1 ? player.w - 2 : 2);
+      const py = player.y + 16;
+      pee.push({
+        x: px, y: py,
+        vx: player.facing * (1.5 + Math.random()*1.5),
+        vy: -1 + Math.random()*1.5,
+        life: 50,
+        puke: true, // для отрисовки другим цветом
+      });
+    }
+    return;
+  }
+
+  // --- Наполнение супер-бутылки: игрок полностью парализован ---
+  if (player.fillingTimer > 0){
+    player.fillingTimer--;
+    player.vx = 0;
+    // гравитация всё равно работает
+    player.vy += GRAVITY;
+    if (player.vy > 18) player.vy = 18;
+    player.x += 0;
+    resolvePlatformCollision(player);
+    player.y += player.vy;
+    resolvePlatformCollision(player);
+    if (player.invuln > 0) player.invuln--;
+    // эмитим маленькие капли в бутылку (визуал)
+    if (player.fillingTimer % 2 === 0){
+      const bx = player.x + (player.facing === 1 ? player.w + 8 : -8);
+      const by = player.y + 30;
+      pee.push({
+        x: bx, y: by,
+        vx: 0, vy: 0.5,
+        life: 8,
+        inBottle: true,
+      });
+    }
+    // завершение
+    if (player.fillingTimer === 0){
+      player.superBottles++;
+      player.emptyBottles--;
+      player.peeTank = Math.max(0, player.peeTank - FILL_PEE_COST);
+      while (player.peeSegments.length > 0 && player.peeSegments[player.peeSegments.length-1] >= player.peeTank){
+        player.peeSegments.pop();
+      }
+      sndFillDone();
+      flashMsg('Супер-бутылка готова! Всего: ' + player.superBottles);
+    }
+    return; // никакого другого управления
+  }
+
+  const speed = 4.2;
+  let ax = 0;
+
+  player.crouch = keys['ArrowDown'] && player.onGround;
+  const curSpeed = player.crouch ? speed*0.4 : speed;
+
+  if (keys['ArrowLeft']) { ax = -curSpeed; player.facing = -1; }
+  if (keys['ArrowRight']) { ax = curSpeed; player.facing = 1; }
+  player.vx = ax;
+
+  if (keys['ArrowUp'] && player.onGround && !player.crouch){
+    player.vy = -13.5;
+    player.onGround = false;
+    sndJump();
+  }
+
+  player.vy += GRAVITY;
+  if (player.vy > 18) player.vy = 18;
+
+  const oldH = player.h;
+  player.h = player.crouch ? 44 : 64;
+  if (player.h < oldH) player.y += (oldH - player.h);
+
+  player.x += player.vx;
+  resolvePlatformCollision(player);
+  player.y += player.vy;
+  resolvePlatformCollision(player);
+
+  if (player.x < 0) player.x = 0;
+  if (player.x + player.w > LEVEL_WIDTH) player.x = LEVEL_WIDTH - player.w;
+
+  if (Math.abs(player.vx) > 0.1 && player.onGround) player.walkPhase += 0.25;
+  player.scarfWave += 0.15;
+
+  // плавное поднятие шарфа от скорости
+  const targetLift = Math.min(1, Math.abs(player.vx) / 4.5);
+  player.scarfLift += (targetLift - player.scarfLift) * 0.15;
+
+  if (player.attackTimer > 0) player.attackTimer--;
+  if (player.invuln > 0) player.invuln--;
+
+  if (player.attackTimer === 0){
+    if (keys['KeyA']) {
+      player.attackTimer = 12;
+      player.attackType = 'fist';
+      player.attackRange = 28;
+      player.attackDamage = 1;
+      player.attackHitStart = 8;
+      sndPunch();
+    } else if (keys['KeyD']) {
+      player.attackTimer = 50;
+      player.attackType = 'scarf';
+      player.attackRange = 80;
+      player.attackDamage = 3;
+      player.attackHitStart = 12;
+      sndScarfSwing();
+    }
+  }
+
+  // Мочеиспускание — удерживание S, работает стоя и если есть запас
+  const canPee = keys['KeyS'] && player.onGround && !player.crouch && player.attackTimer === 0 && player.peeTank > 0;
+
+  // Старт/стоп звука струи
+  if (canPee && !player.peeing){
+    player.peeSound = sndPeeStream();
+  } else if (!canPee && player.peeing){
+    sndPeeStop(player.peeSound);
+    player.peeSound = null;
+  }
+
+  player.peeing = canPee;
+  if (canPee){
+    player.peeTank--;
+    // эмитим частицу
+    const px = player.x + (player.facing === 1 ? player.w - 4 : 4);
+    const py = player.y + 38;
+    pee.push({
+      x: px, y: py,
+      vx: player.facing * (2 + Math.random()*1.2),
+      vy: -0.5 + Math.random()*0.8,
+      life: 70,
+    });
+    // чистим пустые сегменты
+    while (player.peeSegments.length > 0 && player.peeSegments[player.peeSegments.length-1] > player.peeTank){
+      player.peeSegments.pop();
+    }
+  }
+
+  // Хитбокс атаки активен только в «ударной» фазе
+  const totalAttackTime = player.attackType === 'scarf' ? 50 : 12;
+  const elapsed = totalAttackTime - player.attackTimer;
+  const inHitFrame = player.attackType && elapsed >= (totalAttackTime - player.attackHitStart);
+
+  // Звук хлыста шарфа в момент начала ударной фазы
+  if (player.attackType === 'scarf' && elapsed === (totalAttackTime - player.attackHitStart)){
+    sndScarfHit();
+  }
+
+  if (inHitFrame && player.attackType){
+    const hx = player.facing === 1 ? player.x + player.w : player.x - player.attackRange;
+    const hy = player.y + 10;
+    const hit = {x: hx, y: hy, w: player.attackRange, h: 40};
+    for (const e of enemies){
+      if (!e.alive) continue;
+      if (rectsOverlap(hit, e) && e.hitCd === 0){
+        const playerFromFront = (player.facing === 1 && e.facing === -1) || (player.facing === -1 && e.facing === 1);
+        if (e.type === 'shield' && player.attackType === 'fist' && playerFromFront){
+          e.hitCd = 10;
+          player.vx = -player.facing * 3;
+          playTone(100, 0.08, 'square', 0.2, 0.002, 0.02);
+        } else {
+          e.hp -= player.attackDamage;
+          e.hitCd = 25;
+          e.vx = player.facing * (player.attackType === 'scarf' ? 7 : 4);
+          if (e.hp <= 0){ e.alive = false; sndEnemyDeath(); }
+        }
+      }
+    }
+  }
+
+  // Стомп — прыжок на голову (только в реальном падении сверху)
+  if (player.vy > 3 && !player.onGround && !player.dead){
+    for (const e of enemies){
+      if (!e.alive) continue;
+      const feet = {x: player.x+4, y: player.y + player.h - 8, w: player.w-8, h: 12};
+      const head = {x: e.x+2, y: e.y, w: e.w-4, h: 14};
+      const comingFromAbove = (player.y + player.h - player.vy) <= e.y + 4;
+      if (rectsOverlap(feet, head) && e.hitCd === 0 && comingFromAbove){
+        e.hp--;
+        e.hitCd = 25;
+        sndStomp();
+        if (e.hp <= 0){ e.alive = false; sndEnemyDeath(); }
+        player.vy = -10;
+      }
+    }
+  }
+
+  // Автоподбор полной бутылки пива
+  for (const b of beers){
+    if (b.taken) continue;
+    const br = {x:b.x, y:b.y, w:b.w, h:b.h};
+    const pr = {x:player.x, y:player.y, w:player.w, h:player.h};
+    if (rectsOverlap(pr, br)){
+      b.taken = true;
+      if (b.nonAlco){
+        player.pukeTimer = player.pukeTotal;
+        player.hp = Math.max(0, player.hp - 1);
+        player.attackTimer = 0;
+        player.peeing = false;
+        sndHurt();
+        if (player.hp <= 0){
+          player.dead = true;
+          sndDefeat();
+        }
+        flashMsg('БЕЗАЛКОГОЛЬНОЕ! −1 HP');
+      } else {
+        player.fullBeers++;
+        sndPickupBeer();
+        flashMsg('Полная бутылка пива (всего: ' + player.fullBeers + ')');
+      }
+    }
+  }
+
+  // E — выпить полную бутылку пива
+  if (consumePress('KeyE')){
+    if (player.fullBeers === 0){
+      flashMsg('Нет полных бутылок.');
+    } else {
+      player.fullBeers--;
+      player.emptyBottles++;
+      if (player.hp < player.maxHp) player.hp++;
+      const before = player.peeTank;
+      player.peeTank = Math.min(player.peeTankMax, player.peeTank + PEE_PER_BEER_FRAMES);
+      if (player.peeTank > before){
+        player.peeSegments.push(before);
+      }
+      sndDrinkBeer();
+      flashMsg('Выпил пиво. Пустая бутылка +1, моча +' + (PEE_PER_BEER_FRAMES/60) + ' сек.');
+    }
+  }
+
+  // Q — бросок пустой бутылки (малый урон, без зоны)
+  if (consumePress('KeyQ')){
+    if (player.emptyBottles === 0){
+      flashMsg('Нет пустых бутылок.');
+    } else {
+      player.emptyBottles--;
+      const bx = player.x + (player.facing === 1 ? player.w : 0);
+      const by = player.y + 20;
+      bottles.push({
+        x: bx, y: by,
+        vx: player.facing * 8,
+        vy: -8,
+        rot: 0,
+        rotSpeed: player.facing * 0.4,
+        kind: 'empty',
+        life: 300,
+      });
+      sndThrow();
+      flashMsg('Пустая бутылка полетела.');
+    }
+  }
+
+  // F — наполнить пустую бутылку мочой (супер-бутылка)
+  if (consumePress('KeyF')){
+    if (player.emptyBottles === 0){
+      flashMsg('Нет пустой бутылки.');
+    } else if (player.peeTank < FILL_PEE_COST){
+      flashMsg('Мало мочи (нужно ' + (FILL_PEE_COST/60).toFixed(1) + ' сек).');
+    } else if (!player.onGround){
+      flashMsg('Только стоя на земле.');
+    } else {
+      player.fillingTimer = player.fillingTotal;
+      player.attackTimer = 0;
+      player.peeing = false;
+      sndFillBottle();
+    }
+  }
+
+  // T — бросок супер-бутылки (взрыв с зоной)
+  if (consumePress('KeyT')){
+    if (player.superBottles === 0){
+      flashMsg('Нет супер-бутылок.');
+    } else {
+      player.superBottles--;
+      const bx = player.x + (player.facing === 1 ? player.w : 0);
+      const by = player.y + 20;
+      bottles.push({
+        x: bx, y: by,
+        vx: player.facing * 7.5,
+        vy: -7.5,
+        rot: 0,
+        rotSpeed: player.facing * 0.35,
+        kind: 'super',
+        life: 300,
+      });
+      sndThrow();
+      flashMsg('Супер-граната пошла!');
+    }
+  }
+
+  if (player.y > H + 200) player.hp = 0;
+  if (player.hp <= 0 && !player.dead){
+    player.dead = true;
+    sndDefeat();
+    if (player.peeing && player.peeSound){ sndPeeStop(player.peeSound); player.peeSound = null; player.peeing = false; }
+    flashMsg('Поражение. Нажмите R для рестарта.');
+  }
+
+  if (player.x > LEVEL_WIDTH - 80 && !player.dead){
+    player.dead = true;
+    sndVictory();
+    if (player.peeing && player.peeSound){ sndPeeStop(player.peeSound); player.peeSound = null; player.peeing = false; }
+    flashMsg('Победа! Нажмите R для рестарта.');
+  }
+
+  camX = player.x - W/2 + player.w/2;
+  if (camX < 0) camX = 0;
+  if (camX > LEVEL_WIDTH - W) camX = LEVEL_WIDTH - W;
+}
+
+function updateEnemies(){
+  for (const e of enemies){
+    if (!e.alive) continue;
+    if (e.hitCd > 0) e.hitCd--;
+    if (e.attackCd > 0) e.attackCd--;
+
+    const dx = player.x - e.x;
+    const dist = Math.abs(dx);
+    if (dist < 350 && !player.dead){
+      e.facing = dx > 0 ? 1 : -1;
+      const sp = e.type === 'baton' ? 1.8 : 1.2;
+      if (dist > 40) e.vx = e.facing * sp;
+      else e.vx = 0;
+    } else e.vx = 0;
+
+    if (Math.abs(e.vx) > 0.1 && e.onGround) e.walkPhase += 0.2;
+
+    e.vy += GRAVITY;
+    if (e.vy > 18) e.vy = 18;
+    e.x += e.vx;
+    resolvePlatformCollision(e);
+    e.y += e.vy;
+    resolvePlatformCollision(e);
+
+    if (!player.dead && player.invuln === 0 && e.attackCd === 0){
+      const reach = e.type === 'baton' ? 36 : 28;
+      const ax = e.facing === 1 ? e.x + e.w : e.x - reach;
+      const hit = {x:ax, y:e.y+10, w:reach, h:40};
+      const pr = {x:player.x, y:player.y, w:player.w, h:player.h};
+      if (rectsOverlap(hit, pr)){
+        // не бьёт если игрок сверху и падает
+        const playerAbove = player.y + player.h < e.y + 20 && player.vy > 0;
+        if (!playerAbove){
+          player.hp--;
+          player.invuln = 45;
+          player.vx = -e.facing * 4;
+          player.vy = -6;
+          e.attackCd = 55;
+          sndHurt();
+        }
+      }
+    }
+
+    if (e.y > H + 200) e.alive = false;
+  }
+}
+
+function updateBeers(){ for (const b of beers) b.bob += 0.08; }
+
+function updatePee(){
+  for (let i = pee.length - 1; i >= 0; i--){
+    const p = pee[i];
+    // частицы в режиме «наполнения» — короткие, без физики и без урона
+    if (p.inBottle){
+      p.life--;
+      if (p.life <= 0) pee.splice(i, 1);
+      continue;
+    }
+    p.vy += 0.35;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.life--;
+
+    let hitGround = false;
+    for (const pl of platforms){
+      if (p.x >= pl[0] && p.x <= pl[0]+pl[2] && p.y >= pl[1] && p.y <= pl[1]+pl[3]){
+        hitGround = true; break;
+      }
+    }
+    if (hitGround || p.life <= 0 || p.y > H){
+      pee.splice(i, 1);
+      continue;
+    }
+
+    for (const e of enemies){
+      if (!e.alive) continue;
+      if (p.x >= e.x && p.x <= e.x + e.w && p.y >= e.y && p.y <= e.y + e.h){
+        // кислотный урон — медленный, требует удерживать поток
+        e.hp -= 0.04;
+        if (e.hp <= 0) e.alive = false;
+        pee.splice(i, 1);
+        break;
+      }
+    }
+  }
+}
+
+function spawnSplash(x, y, isSuper){
+  const maxR = isSuper ? 90 : 30;
+  splashes.push({x, y, r: 0, maxR, life: isSuper ? 40 : 20, maxLife: isSuper ? 40 : 20, super: isSuper});
+  // частицы-брызги
+  const n = isSuper ? 30 : 10;
+  for (let i = 0; i < n; i++){
+    const a = Math.random() * Math.PI * 2;
+    const sp = 2 + Math.random() * (isSuper ? 7 : 4);
+    pee.push({
+      x, y,
+      vx: Math.cos(a) * sp,
+      vy: Math.sin(a) * sp - 2,
+      life: isSuper ? 50 : 25,
+    });
+  }
+  // лужа на земле (только для супер-взрыва)
+  if (isSuper){
+    // найти ближайшую платформу под точкой взрыва
+    let landY = null;
+    for (const pl of platforms){
+      if (x >= pl[0] && x <= pl[0]+pl[2] && pl[1] >= y){
+        if (landY === null || pl[1] < landY) landY = pl[1];
+      }
+    }
+    if (landY !== null){
+      peeSplatters.push({
+        x: x - maxR, y: landY - 2,
+        w: maxR * 2, life: 180, maxLife: 180,
+      });
+    }
+  }
+}
+
+function updateBottles(){
+  for (let i = bottles.length - 1; i >= 0; i--){
+    const b = bottles[i];
+    b.vy += 0.5;
+    b.x += b.vx;
+    b.y += b.vy;
+    b.rot += b.rotSpeed;
+    b.life--;
+
+    const isSuper = b.kind === 'super';
+
+    let detonated = false;
+    // столкновение с платформами
+    for (const pl of platforms){
+      if (b.x >= pl[0] && b.x <= pl[0]+pl[2] && b.y >= pl[1] - 4 && b.y <= pl[1]+pl[3]){
+        detonated = true;
+        b.y = pl[1] - 4;
+        break;
+      }
+    }
+    // столкновение с врагами
+    if (!detonated){
+      for (const e of enemies){
+        if (!e.alive) continue;
+        if (b.x >= e.x && b.x <= e.x+e.w && b.y >= e.y && b.y <= e.y+e.h){
+          detonated = true;
+          // прямое попадание пустой бутылкой — малый урон только этому врагу
+          if (!isSuper){
+            e.hp -= 1.5;
+            e.hitCd = 20;
+            e.vx = Math.sign(b.vx) * 5;
+            if (e.hp <= 0) e.alive = false;
+          }
+          break;
+        }
+      }
+    }
+
+    if (detonated){
+      spawnSplash(b.x, b.y, isSuper);
+      if (isSuper){
+        sndExplosion();
+        // урон всем в радиусе
+        const r = 90;
+        for (const e of enemies){
+          if (!e.alive) continue;
+          const dx = (e.x + e.w/2) - b.x;
+          const dy = (e.y + e.h/2) - b.y;
+          if (dx*dx + dy*dy <= r*r){
+            e.hp -= 5;
+            e.hitCd = 30;
+            e.vx = Math.sign(dx || 1) * 8;
+            e.vy = -6;
+            if (e.hp <= 0) e.alive = false;
+          }
+        }
+      } else {
+        sndBottleBreak();
+      }
+      bottles.splice(i, 1);
+      continue;
+    }
+
+    if (b.life <= 0 || b.y > H + 100){
+      bottles.splice(i, 1);
+    }
+  }
+}
+
+function updateSplashes(){
+  for (let i = splashes.length - 1; i >= 0; i--){
+    const s = splashes[i];
+    s.life--;
+    s.r = s.maxR * (1 - s.life / s.maxLife);
+    if (s.life <= 0) splashes.splice(i, 1);
+  }
+}
+
+function updateSplatters(){
+  for (let i = peeSplatters.length - 1; i >= 0; i--){
+    const s = peeSplatters[i];
+    s.life--;
+    // урон врагам, стоящим в луже
+    for (const e of enemies){
+      if (!e.alive) continue;
+      if (e.y + e.h >= s.y - 4 && e.y + e.h <= s.y + 6 &&
+          e.x + e.w/2 >= s.x && e.x + e.w/2 <= s.x + s.w){
+        if (e.hitCd === 0){
+          e.hp -= 0.1;
+          if (e.hp <= 0) e.alive = false;
+        }
+      }
+    }
+    if (s.life <= 0) peeSplatters.splice(i, 1);
+  }
+}
+
+// --- Рисование ---
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#4A9FD6');
+  g.addColorStop(0.6,'#9BC9E8');
+  g.addColorStop(1,'#CDEBFF');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+
+  // солнце
+  const sunX = 150 - (camX*0.05)%900;
+  ctx.fillStyle = 'rgba(255,240,180,0.6)';
+  ctx.beginPath(); ctx.arc(sunX, 90, 50, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,230,150,0.9)';
+  ctx.beginPath(); ctx.arc(sunX, 90, 35, 0, Math.PI*2); ctx.fill();
+
+  // дальние облака
+  ctx.fillStyle = 'rgba(255,255,255,0.7)';
+  for (let i=0;i<6;i++){
+    const cx = i*350 - (camX*0.1)%1000 + 50;
+    ctx.beginPath();
+    ctx.arc(cx, 60, 20, 0, Math.PI*2);
+    ctx.arc(cx+20, 55, 25, 0, Math.PI*2);
+    ctx.arc(cx+45, 62, 22, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // дальние дома (параллакс 0.3)
+  for (let i=0;i<25;i++){
+    const bx = i*220 - (camX*0.3)%220 - 100;
+    const bh = 140 + (i%3)*30;
+    // градиент дома
+    const dg = ctx.createLinearGradient(bx, H-bh, bx, H-60);
+    dg.addColorStop(0, '#4A5A6A');
+    dg.addColorStop(1, '#2A3A4A');
+    ctx.fillStyle = dg;
+    ctx.fillRect(bx, H-bh, 160, bh-60);
+    // крыша
+    ctx.fillStyle = '#1A2A3A';
+    ctx.fillRect(bx-5, H-bh, 170, 8);
+    // окна
+    for (let w=0; w<5; w++) for (let h=0; h<Math.floor((bh-80)/35); h++){
+      const lit = (i*7+w*3+h) % 4 === 0;
+      ctx.fillStyle = lit ? '#FFE680' : '#1A2A3A';
+      ctx.fillRect(bx+15+w*28, H-bh+20+h*35, 14, 18);
+    }
+  }
+
+  // ближние дома (параллакс 0.6)
+  for (let i=0;i<35;i++){
+    const bx = i*180 - (camX*0.6)%180 - 50;
+    const bh = 90 + (i%4)*20;
+    const dg = ctx.createLinearGradient(bx, H-bh-60, bx, H-60);
+    dg.addColorStop(0, '#8A6A4A');
+    dg.addColorStop(1, '#5A3A2A');
+    ctx.fillStyle = dg;
+    ctx.fillRect(bx, H-bh-60, 130, bh);
+    ctx.fillStyle = '#3A2010';
+    ctx.fillRect(bx, H-bh-60, 130, 5);
+    // окна
+    for (let w=0; w<3; w++) for (let h=0; h<Math.floor(bh/30); h++){
+      ctx.fillStyle = '#2A1A0A';
+      ctx.fillRect(bx+15+w*35, H-bh-50+h*30, 18, 20);
+      ctx.fillStyle = 'rgba(255,220,150,0.4)';
+      ctx.fillRect(bx+17+w*35, H-bh-48+h*30, 14, 16);
+    }
+  }
+}
+
+function drawPlatforms(){
+  for (const p of platforms){
+    const x = p[0] - camX;
+    if (x + p[2] < 0 || x > W) continue;
+    if (p[1] === GROUND_Y){
+      // асфальт с градиентом
+      const gg = ctx.createLinearGradient(0, p[1], 0, p[1]+p[3]);
+      gg.addColorStop(0, '#555');
+      gg.addColorStop(1, '#2A2A2A');
+      ctx.fillStyle = gg;
+      ctx.fillRect(x, p[1], p[2], p[3]);
+      // бордюр сверху
+      ctx.fillStyle = '#777';
+      ctx.fillRect(x, p[1], p[2], 3);
+      // жёлтая разметка
+      ctx.fillStyle = '#FFD400';
+      for (let i=0;i<p[2];i+=60){
+        ctx.fillRect(x+i, p[1]+30, 35, 4);
+      }
+    } else {
+      // бетонный парапет с фактурой
+      const gg = ctx.createLinearGradient(0, p[1], 0, p[1]+p[3]);
+      gg.addColorStop(0, '#9A9A9A');
+      gg.addColorStop(1, '#5A5A5A');
+      ctx.fillStyle = gg;
+      ctx.fillRect(x, p[1], p[2], p[3]);
+      ctx.fillStyle = '#B0B0B0';
+      ctx.fillRect(x, p[1], p[2], 3);
+      ctx.fillStyle = '#3A3A3A';
+      ctx.fillRect(x, p[1]+p[3]-2, p[2], 2);
+    }
+  }
+}
+
+function drawScarf(cx, cy, dir, flowing, wave, lift, speed){
+  // cx, cy — центр шеи
+  // dir: направление хвоста (-1 назад от лица, 1 вперёд)
+  // flowing: усиленный режим при атаке
+  // lift: 0..1, насколько хвост приподнят сзади (зависит от скорости движения)
+  // speed: модуль горизонтальной скорости игрока
+
+  // жёлто-синий узор на шее (всегда статичен)
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(cx-13, cy, 26, 6);
+  ctx.fillStyle = '#1E4FD6';
+  ctx.fillRect(cx-13, cy+3, 26, 3);
+
+  // хвост шарфа
+  const tailLen = flowing ? 50 : 34;
+  const segs = 8;
+  const segLen = tailLen / segs;
+
+  // в покое (lift=0) — хвост свисает вниз сзади: угол ~85° от горизонта вниз
+  // в движении (lift=1) — хвост поднят почти горизонтально назад: угол ~15°
+  // интерполяция: angle = (1-lift)*downAngle + lift*flatAngle
+  const downA = Math.PI * 0.42;   // вниз (почти 90°)
+  const flatA = Math.PI * 0.08;   // почти горизонтально
+  const baseAngle = downA * (1 - lift) + flatA * lift;
+
+  // начальная точка — сзади шеи
+  let px = cx + dir * 8;
+  let py = cy + 4;
+
+  // строим точки хвоста
+  const pts = [[px, py]];
+  for (let i = 1; i <= segs; i++){
+    // угол каждого сегмента немного отклоняется от базового — эффект провисания/развевания
+    const t = i/segs;
+    // колыхание усиливается к кончику; амплитуда зависит от скорости и режима
+    const waveAmp = flowing ? 6 : (1.5 + speed * 0.9);
+    const waveShift = Math.sin(wave + i*0.7) * waveAmp * (0.3 + t*0.7);
+    // итоговый угол: базовый + небольшое провисание к вниз по длине в покое
+    const sagBias = (1 - lift) * 0.08 * i; // в покое каждый сегмент чуть больше вниз
+    const ang = baseAngle + sagBias;
+    const dx = Math.cos(ang) * segLen * dir;
+    const dy = Math.sin(ang) * segLen + waveShift * 0.15;
+    px = pts[i-1][0] + dx;
+    py = pts[i-1][1] + dy + (flowing ? 0 : waveShift * 0.3);
+    pts.push([px, py]);
+  }
+
+  // рисуем жёлтую ленту
+  ctx.strokeStyle = '#FFD400';
+  ctx.lineCap = 'round';
+  for (let i = 1; i < pts.length; i++){
+    ctx.lineWidth = 7 - i*0.35;
+    ctx.beginPath();
+    ctx.moveTo(pts[i-1][0], pts[i-1][1]);
+    ctx.lineTo(pts[i][0], pts[i][1]);
+    ctx.stroke();
+  }
+  // синяя полоса смещена внутри
+  ctx.strokeStyle = '#1E4FD6';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  for (let i = 0; i < pts.length; i++){
+    const offY = 1.5;
+    if (i === 0) ctx.moveTo(pts[i][0], pts[i][1] + offY);
+    else ctx.lineTo(pts[i][0], pts[i][1] + offY);
+  }
+  ctx.stroke();
+
+  // бахрома на конце
+  const [ex, ey] = pts[pts.length-1];
+  ctx.strokeStyle = '#FFD400';
+  ctx.lineWidth = 1.6;
+  for (let f = 0; f < 4; f++){
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    // бахрома всегда свисает чуть вниз
+    ctx.lineTo(ex + dir * (2 + f*1.5), ey + 5 + f*1.5);
+    ctx.stroke();
+  }
+}
+
+function drawFan(){
+  const x = player.x - camX;
+  const y = player.y;
+  const w = player.w, h = player.h;
+  const blink = player.invuln > 0 && Math.floor(player.invuln/4)%2===0;
+  ctx.save();
+  if (blink) ctx.globalAlpha = 0.4;
+
+  // При блевании — наклоняем персонажа вперёд (15° в сторону лица)
+  if (player.pukeTimer > 0){
+    const pivotX = x + w/2;
+    const pivotY = y + h - 10;
+    const shake = Math.sin(Date.now()/40) * 1.5; // мелкая тряска от спазмов
+    ctx.translate(pivotX + shake, pivotY);
+    ctx.rotate(player.facing * 0.28);
+    ctx.translate(-pivotX, -pivotY);
+  }
+
+  const crouch = player.crouch;
+  const legOffset = Math.sin(player.walkPhase) * (crouch ? 0 : 3);
+
+  // --- Ноги ---
+  const hipY = y + h - 22;
+  // джинсы
+  ctx.fillStyle = '#2A4A7A';
+  // левая
+  ctx.fillRect(x+7, hipY, 9, 20 - Math.abs(legOffset));
+  // правая
+  ctx.fillRect(x+18, hipY, 9, 20 - Math.abs(-legOffset));
+  // затенение
+  ctx.fillStyle = '#1A3A6A';
+  ctx.fillRect(x+7, hipY, 3, 20 - Math.abs(legOffset));
+  ctx.fillRect(x+18, hipY, 3, 20 - Math.abs(-legOffset));
+
+  // кроссовки
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(x+5, y+h-4, 12, 4);
+  ctx.fillRect(x+17, y+h-4, 12, 4);
+  ctx.fillStyle = '#1E4FD6';
+  ctx.fillRect(x+5, y+h-2, 12, 2);
+  ctx.fillRect(x+17, y+h-2, 12, 2);
+
+  // --- Торс (футболка жёлто-синяя полосами) ---
+  const torsoY = crouch ? y + 10 : y + 22;
+  const torsoH = crouch ? 20 : 24;
+  // синяя основа
+  ctx.fillStyle = '#1E4FD6';
+  ctx.fillRect(x+4, torsoY, w-8, torsoH);
+  // жёлтые полосы
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(x+4, torsoY+4, w-8, 4);
+  ctx.fillRect(x+4, torsoY+14, w-8, 4);
+  // затенение торса
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.fillRect(x+4, torsoY, 4, torsoH);
+  // цифра/эмблема спереди
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(x+14, torsoY+9, 6, 6);
+
+  // --- Руки ---
+  const armSwing = Math.sin(player.walkPhase + Math.PI) * 2;
+  // кожа — цвет
+  const skin = '#E8B892';
+  const skinShade = '#C89A72';
+
+  // неатакующая рука
+  let leftArmY = torsoY + 2;
+  let leftArmH = 18;
+  if (!player.attackType || player.attackTimer === 0){
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(x+1, leftArmY, 5, 14);
+    ctx.fillStyle = skin;
+    ctx.fillRect(x+1, leftArmY+14, 5, 5);
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(x+w-6, leftArmY, 5, 14);
+    ctx.fillStyle = skin;
+    ctx.fillRect(x+w-6, leftArmY+14, 5, 5);
+  } else {
+    // одна рука отведена для атаки, другая обычная
+    if (player.facing === 1){
+      ctx.fillStyle = '#1E4FD6';
+      ctx.fillRect(x+1, leftArmY, 5, 14);
+      ctx.fillStyle = skin;
+      ctx.fillRect(x+1, leftArmY+14, 5, 5);
+    } else {
+      ctx.fillStyle = '#1E4FD6';
+      ctx.fillRect(x+w-6, leftArmY, 5, 14);
+      ctx.fillStyle = skin;
+      ctx.fillRect(x+w-6, leftArmY+14, 5, 5);
+    }
+  }
+
+  // --- Голова ---
+  const headY = crouch ? y : y + 2;
+  // шея
+  ctx.fillStyle = skinShade;
+  ctx.fillRect(x+12, headY+16, 10, 6);
+  // лицо
+  ctx.fillStyle = skin;
+  ctx.fillRect(x+9, headY+2, 16, 16);
+  // затенение сбоку
+  ctx.fillStyle = skinShade;
+  if (player.facing === 1) ctx.fillRect(x+9, headY+2, 3, 16);
+  else ctx.fillRect(x+22, headY+2, 3, 16);
+  // волосы
+  ctx.fillStyle = '#3A2410';
+  ctx.fillRect(x+8, headY+1, 18, 6);
+  ctx.fillRect(x+8, headY+1, 4, 10);
+  ctx.fillRect(x+22, headY+1, 4, 10);
+  // глаза
+  ctx.fillStyle = '#FFF';
+  if (player.facing === 1){
+    ctx.fillRect(x+15, headY+9, 4, 4);
+    ctx.fillRect(x+21, headY+9, 4, 4);
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(x+17, headY+10, 2, 3);
+    ctx.fillRect(x+23, headY+10, 2, 3);
+  } else {
+    ctx.fillRect(x+9, headY+9, 4, 4);
+    ctx.fillRect(x+15, headY+9, 4, 4);
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(x+9, headY+10, 2, 3);
+    ctx.fillRect(x+15, headY+10, 2, 3);
+  }
+  // рот
+  ctx.fillStyle = '#8A3020';
+  ctx.fillRect(x+14, headY+15, 6, 1);
+
+  // боевая раскраска на щеках — жёлто-синие полосы
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(x+10, headY+13, 3, 1);
+  ctx.fillRect(x+21, headY+13, 3, 1);
+  ctx.fillStyle = '#1E4FD6';
+  ctx.fillRect(x+10, headY+14, 3, 1);
+  ctx.fillRect(x+21, headY+14, 3, 1);
+
+  // --- Шарф (хвост всегда за спиной; не отрисовываем во время атаки шарфом — его рисуем отдельно как оружие) ---
+  const scarfAttacking = player.attackType === 'scarf' && player.attackTimer > 0;
+  if (!scarfAttacking){
+    const scarfDir = -player.facing; // хвост всегда назад относительно лица
+    const speed = Math.abs(player.vx);
+    drawScarf(x + w/2, headY + 17, scarfDir, false, player.scarfWave, player.scarfLift, speed);
+  } else {
+    // только намотка на шее, без хвоста (хвост будет оружием в виде ленты)
+    ctx.fillStyle = '#FFD400';
+    ctx.fillRect(x + w/2 - 13, headY + 17, 26, 6);
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(x + w/2 - 13, headY + 20, 26, 3);
+  }
+
+  // --- Атаки ---
+  if (player.attackTimer > 0 && player.attackType){
+    const progress = 1 - player.attackTimer / (player.attackType === 'scarf' ? 50 : 12);
+    const dir = player.facing;
+
+    if (player.attackType === 'fist'){
+      const punchX = x + (dir===1 ? w : 0) + dir * (progress * player.attackRange);
+      const pY = torsoY + 4;
+      // рука
+      ctx.strokeStyle = '#1E4FD6';
+      ctx.lineWidth = 7;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x + w/2, pY + 4);
+      ctx.lineTo(punchX, pY + 4);
+      ctx.stroke();
+      // кулак
+      ctx.fillStyle = skin;
+      ctx.fillRect(punchX - 6, pY, 12, 10);
+      ctx.fillStyle = skinShade;
+      ctx.fillRect(punchX - 6, pY+7, 12, 3);
+      // эффект удара
+      if (progress > 0.5){
+        ctx.strokeStyle = '#FFF';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(punchX + dir*8, pY+5, 6, 0, Math.PI*2);
+        ctx.stroke();
+      }
+    } else if (player.attackType === 'scarf'){
+      // Двухфазная анимация: раскрутка (38 кадров = 2 оборота), затем удар (12 кадров)
+      const totalT = 50;
+      const windupT = 38;
+      const elapsedLocal = totalT - player.attackTimer;
+      const sx = x + w/2;
+      const sy = torsoY + 4;
+
+      if (elapsedLocal < windupT){
+        // РАСКРУТКА: шарф крутится над головой по кругу, 2 полных оборота
+        const spinProgress = elapsedLocal / windupT;
+        const angle = spinProgress * Math.PI * 4; // 2 оборота
+        const radius = 22 + spinProgress * 6;
+        const segs = 10;
+        const tailLen = 30;
+        // точка, от которой тянется шарф (рука)
+        const handX = sx + Math.cos(angle) * 10;
+        const handY = sy - 6 + Math.sin(angle) * 6;
+        // строим дугу шарфа радиусом вокруг головы
+        ctx.strokeStyle = '#FFD400';
+        ctx.lineWidth = 6;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        for (let i = 0; i <= segs; i++){
+          const t = i/segs;
+          // шарф по касательной — тянется за рукой, отставая по углу
+          const a = angle - t * 0.9;
+          const r = radius * (1 - t*0.15);
+          const px = sx + Math.cos(a) * r;
+          const py = sy - 6 + Math.sin(a) * r * 0.7; // эллиптическое движение
+          if (i===0) ctx.moveTo(handX, handY);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        // синяя полоса
+        ctx.strokeStyle = '#1E4FD6';
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        for (let i = 0; i <= segs; i++){
+          const t = i/segs;
+          const a = angle - t * 0.9;
+          const r = radius * (1 - t*0.15);
+          const px = sx + Math.cos(a) * r;
+          const py = sy - 6 + Math.sin(a) * r * 0.7 + 2;
+          if (i===0) ctx.moveTo(handX, handY + 2);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        // индикатор зарядки — нарастающее свечение
+        if (spinProgress > 0.6){
+          ctx.fillStyle = `rgba(255, 255, 100, ${(spinProgress - 0.6) * 0.8})`;
+          ctx.beginPath();
+          ctx.arc(sx, sy - 6, 14, 0, Math.PI*2);
+          ctx.fill();
+        }
+      } else {
+        // ФИНАЛЬНЫЙ ХЛЫСТ: длинная волнистая лента вперёд
+        const strikeT = (elapsedLocal - windupT) / (totalT - windupT); // 0..1
+        const sxStart = x + (dir === 1 ? w : 0);
+        const syStart = torsoY + 2;
+        const len = player.attackRange * Math.min(1, strikeT * 2.5);
+        const segs = 14;
+        // жёлтая лента
+        ctx.strokeStyle = '#FFD400';
+        ctx.lineWidth = 10;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        for (let i=0; i<=segs; i++){
+          const t = i/segs;
+          const px = sxStart + dir * len * t;
+          const py = syStart + Math.sin(player.scarfWave*3 + t*7) * 12 * (0.4 + t*0.6);
+          if (i===0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        // синяя полоса
+        ctx.strokeStyle = '#1E4FD6';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        for (let i=0; i<=segs; i++){
+          const t = i/segs;
+          const px = sxStart + dir * len * t;
+          const py = syStart + 3 + Math.sin(player.scarfWave*3 + t*7) * 12 * (0.4 + t*0.6);
+          if (i===0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.stroke();
+        // бахрома на кончике
+        const endX = sxStart + dir * len;
+        const endY = syStart + Math.sin(player.scarfWave*3 + 7) * 12;
+        ctx.strokeStyle = '#FFD400';
+        ctx.lineWidth = 2;
+        for (let f=0; f<5; f++){
+          ctx.beginPath();
+          ctx.moveTo(endX, endY);
+          ctx.lineTo(endX + dir*10, endY - 8 + f*4);
+          ctx.stroke();
+        }
+        // импакт-эффект
+        if (strikeT > 0.3 && strikeT < 0.8){
+          ctx.strokeStyle = `rgba(255, 255, 255, ${1 - strikeT})`;
+          ctx.lineWidth = 3;
+          ctx.beginPath();
+          ctx.arc(endX, endY, 12, 0, Math.PI*2);
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  // --- Визуал блевания после безалкогольного ---
+  if (player.pukeTimer > 0){
+    const progress = 1 - player.pukeTimer / player.pukeTotal;
+    const dir = player.facing;
+    // наклон вперёд
+    const tiltX = dir * 3;
+    // перерисовываем лицо с позеленевшими щеками и открытым ртом
+    // зелёный оттенок на лицо
+    ctx.fillStyle = 'rgba(100, 160, 60, 0.35)';
+    ctx.fillRect(x + 9, headY + 2, 16, 16);
+    // широко открытый рот
+    ctx.fillStyle = '#3A1810';
+    ctx.fillRect(x + 13 + tiltX, headY + 14, 8, 4);
+    // капли пота на лбу
+    ctx.fillStyle = '#88CCFF';
+    if (Math.floor(Date.now()/200) % 2 === 0){
+      ctx.fillRect(x + 12, headY + 6, 2, 3);
+      ctx.fillRect(x + 20, headY + 7, 2, 3);
+    }
+    // таймер сверху
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(x - 4, y - 14, w + 8, 7);
+    ctx.fillStyle = '#8CC04A';
+    ctx.fillRect(x - 3, y - 13, (w + 6) * progress, 5);
+    ctx.strokeStyle = '#FFF';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 4, y - 14, w + 8, 7);
+  }
+
+  // --- Визуал наполнения супер-бутылки ---
+  if (player.fillingTimer > 0){
+    const fillProgress = 1 - player.fillingTimer / player.fillingTotal;
+    const dir = player.facing;
+    // бутылка перед героем на уровне пояса
+    const bx = x + (dir === 1 ? w + 4 : -14);
+    const by = y + 26;
+    // рука, держащая бутылку
+    ctx.strokeStyle = skin;
+    ctx.lineWidth = 5;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x + w/2, torsoY + 6);
+    ctx.lineTo(bx + 5, by + 4);
+    ctx.stroke();
+    // бутылка — стеклянная, наполняется жёлтым снизу
+    ctx.fillStyle = '#1A3010';
+    ctx.fillRect(bx, by, 10, 20);
+    ctx.fillStyle = '#2D5016';
+    ctx.fillRect(bx+2, by-6, 6, 6);
+    // уровень жидкости
+    const liquidH = 18 * fillProgress;
+    const liqG = ctx.createLinearGradient(bx, by + 20 - liquidH, bx, by + 20);
+    liqG.addColorStop(0, '#FFE680');
+    liqG.addColorStop(1, '#C89000');
+    ctx.fillStyle = liqG;
+    ctx.fillRect(bx+1, by + 20 - liquidH, 8, liquidH);
+    // блик на стекле
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.fillRect(bx+1, by, 1, 18);
+
+    // тонкая струйка в бутылку
+    ctx.strokeStyle = 'rgba(255, 220, 60, 0.7)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x + (dir === 1 ? w - 2 : 2), y + 38);
+    ctx.quadraticCurveTo(
+      x + (dir === 1 ? w + 2 : -2), y + 36,
+      bx + 5, by - 2
+    );
+    ctx.stroke();
+
+    // таймер сверху
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(x - 4, y - 14, w + 8, 7);
+    ctx.fillStyle = '#FFD400';
+    ctx.fillRect(x - 3, y - 13, (w + 6) * fillProgress, 5);
+    ctx.strokeStyle = '#FFF';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x - 4, y - 14, w + 8, 7);
+
+    // индикатор уязвимости
+    ctx.fillStyle = '#FF4444';
+    ctx.font = 'bold 10px Arial';
+    ctx.textAlign = 'center';
+    if (Math.floor(Date.now()/300) % 2 === 0){
+      ctx.fillText('УЯЗВИМ!', x + w/2, y - 18);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  ctx.restore();
+}
+
+function drawEnemy(e){
+  const x = e.x - camX;
+  const y = e.y;
+  if (x + e.w < -60 || x > W+60) return;
+
+  const blink = e.hitCd > 0 && Math.floor(e.hitCd/3)%2===0;
+  ctx.save();
+  if (blink) ctx.globalAlpha = 0.6;
+
+  const legOffset = Math.sin(e.walkPhase) * 3;
+
+  // --- Ноги (тактические штаны) ---
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(x+7, y+42, 10, 18 - Math.abs(legOffset));
+  ctx.fillRect(x+19, y+42, 10, 18 - Math.abs(-legOffset));
+  // берцы
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x+5, y+e.h-4, 14, 4);
+  ctx.fillRect(x+17, y+e.h-4, 14, 4);
+
+  // --- Торс (бронежилет) ---
+  ctx.fillStyle = '#2A2A2A';
+  ctx.fillRect(x+3, y+18, e.w-6, 26);
+  // пластины жилета
+  ctx.fillStyle = '#1A1A1A';
+  ctx.fillRect(x+5, y+20, 12, 10);
+  ctx.fillRect(x+19, y+20, 12, 10);
+  ctx.fillRect(x+5, y+32, 12, 10);
+  ctx.fillRect(x+19, y+32, 12, 10);
+  // шеврон
+  ctx.fillStyle = '#8A0000';
+  ctx.fillRect(x+14, y+26, 8, 8);
+  ctx.fillStyle = '#FFF';
+  ctx.fillRect(x+16, y+28, 4, 1);
+  ctx.fillRect(x+16, y+30, 4, 1);
+
+  // --- Шлем ---
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(x+6, y+2, 24, 18);
+  // закругление сверху
+  ctx.fillStyle = '#2A2A2A';
+  ctx.fillRect(x+8, y+0, 20, 4);
+  // забрало
+  const visG = ctx.createLinearGradient(x, y+8, x, y+16);
+  visG.addColorStop(0, '#1A3A5A');
+  visG.addColorStop(1, '#4A7AAA');
+  ctx.fillStyle = visG;
+  ctx.fillRect(x+7, y+8, 22, 8);
+  // блик на забрале
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  ctx.fillRect(x+9, y+9, 6, 2);
+  // ремешок
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x+6, y+16, 24, 2);
+
+  // --- Руки ---
+  // задняя рука
+  ctx.fillStyle = '#2A2A2A';
+  if (e.facing === 1){
+    ctx.fillRect(x, y+20, 5, 16);
+  } else {
+    ctx.fillRect(x+e.w-5, y+20, 5, 16);
+  }
+
+  // --- Экипировка ---
+  if (e.type === 'shield'){
+    // щит (передняя рука держит)
+    const sx = e.facing === 1 ? x + e.w - 4 : x - 10;
+    // тень щита
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(sx+2, y+14, 14, 38);
+    // корпус щита
+    const sg = ctx.createLinearGradient(sx, y+14, sx+14, y+14);
+    sg.addColorStop(0, '#666');
+    sg.addColorStop(0.5, '#AAA');
+    sg.addColorStop(1, '#666');
+    ctx.fillStyle = sg;
+    ctx.fillRect(sx, y+14, 14, 38);
+    // рамка
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(sx, y+14, 14, 38);
+    // надпись "ПОЛИЦИЯ"
+    ctx.fillStyle = '#000';
+    ctx.fillRect(sx+2, y+22, 10, 4);
+    ctx.fillStyle = '#FFF';
+    ctx.font = 'bold 4px Arial';
+    ctx.fillText('POLICE', sx+2, y+25);
+    // окошко
+    ctx.fillStyle = 'rgba(100,150,200,0.5)';
+    ctx.fillRect(sx+3, y+30, 8, 6);
+  } else {
+    // дубинка (передняя рука)
+    const bx = e.facing === 1 ? x + e.w - 2 : x - 24;
+    // рука держит
+    ctx.fillStyle = '#2A2A2A';
+    ctx.fillRect(bx + (e.facing===1 ? -4 : 22), y+22, 6, 8);
+    // дубинка
+    ctx.fillStyle = '#1a1a1a';
+    ctx.fillRect(bx, y+24, 24, 4);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(bx, y+24, 24, 1);
+    // рукоять
+    ctx.fillStyle = '#000';
+    ctx.fillRect(bx + (e.facing===1 ? 0 : 20), y+22, 4, 8);
+  }
+
+  // --- HP бар ---
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(x+2, y-8, e.w, 4);
+  ctx.fillStyle = '#e11';
+  ctx.fillRect(x+2, y-8, e.w * (e.hp/e.maxHp), 4);
+  ctx.strokeStyle = '#000';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x+2, y-8, e.w, 4);
+
+  ctx.restore();
+}
+
+function drawPee(){
+  for (const p of pee){
+    const x = p.x - camX;
+    if (x < -10 || x > W+10) continue;
+    const alpha = Math.min(1, p.life / 40);
+    if (p.puke){
+      // блевотина — грязно-зелёно-оранжевая
+      ctx.fillStyle = `rgba(140, 160, 40, ${alpha})`;
+      ctx.beginPath();
+      ctx.ellipse(x, p.y, 3, 4, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(200, 130, 40, ${alpha * 0.7})`;
+      ctx.beginPath();
+      ctx.ellipse(x, p.y - 0.5, 1.2, 1.8, 0, 0, Math.PI*2);
+      ctx.fill();
+    } else {
+      // моча — жёлтая
+      ctx.fillStyle = `rgba(255, 220, 60, ${alpha})`;
+      ctx.beginPath();
+      ctx.ellipse(x, p.y, 2.5, 3.5, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, 180, ${alpha * 0.7})`;
+      ctx.beginPath();
+      ctx.ellipse(x, p.y - 0.5, 1, 1.5, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+// Анимация позы при мочеиспускании — рисуем поверх персонажа
+function drawPeeStream(){
+  if (!player.peeing) return;
+  const x = player.x - camX;
+  const y = player.y;
+  const dir = player.facing;
+  const sx = x + (dir === 1 ? player.w - 2 : 2);
+  const sy = y + 38;
+
+  // короткий визуальный «выход» струи у персонажа
+  ctx.strokeStyle = 'rgba(255, 220, 60, 0.8)';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.lineTo(sx + dir*6, sy + 2);
+  ctx.stroke();
+}
+
+function drawBottles(){
+  for (const b of bottles){
+    const x = b.x - camX;
+    if (x < -40 || x > W+40) continue;
+    ctx.save();
+    ctx.translate(x, b.y);
+    ctx.rotate(b.rot);
+
+    const isSuper = b.kind === 'super';
+
+    // тело
+    const bodyG = ctx.createLinearGradient(-6, 0, 6, 0);
+    if (isSuper){
+      bodyG.addColorStop(0, '#C8A000');
+      bodyG.addColorStop(0.5, '#FFD400');
+      bodyG.addColorStop(1, '#C8A000');
+    } else {
+      bodyG.addColorStop(0, '#5A2F0A');
+      bodyG.addColorStop(0.5, '#E89030');
+      bodyG.addColorStop(1, '#5A2F0A');
+    }
+    ctx.fillStyle = bodyG;
+    ctx.fillRect(-6, -2, 12, 14);
+    // плечи
+    ctx.beginPath();
+    ctx.moveTo(-2, -8);
+    ctx.lineTo(-6, -2);
+    ctx.lineTo(6, -2);
+    ctx.lineTo(2, -8);
+    ctx.closePath();
+    ctx.fill();
+    // горлышко
+    ctx.fillStyle = isSuper ? '#C8A000' : '#6A3A10';
+    ctx.fillRect(-2, -14, 4, 6);
+    // крышка
+    ctx.fillStyle = '#FFD400';
+    ctx.fillRect(-2, -16, 4, 2);
+    // этикетка
+    ctx.fillStyle = isSuper ? '#1E4FD6' : '#FFD400';
+    ctx.fillRect(-6, 2, 12, 6);
+    // блик
+    ctx.fillStyle = 'rgba(255, 240, 200, 0.5)';
+    ctx.fillRect(-5, -1, 1, 12);
+    // контур
+    ctx.strokeStyle = 'rgba(40, 20, 5, 0.6)';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(-2, -16);
+    ctx.lineTo(-2, -8);
+    ctx.lineTo(-6, -2);
+    ctx.lineTo(-6, 12);
+    ctx.lineTo(6, 12);
+    ctx.lineTo(6, -2);
+    ctx.lineTo(2, -8);
+    ctx.lineTo(2, -16);
+    ctx.closePath();
+    ctx.stroke();
+
+    // супер-свечение
+    if (isSuper){
+      ctx.strokeStyle = 'rgba(255, 230, 100, 0.6)';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(-7, -17, 14, 31);
+    }
+
+    ctx.restore();
+  }
+}
+
+function drawSplashes(){
+  for (const s of splashes){
+    const x = s.x - camX;
+    const alpha = s.life / s.maxLife;
+    // внешняя волна
+    ctx.strokeStyle = `rgba(255, 220, 60, ${alpha * 0.8})`;
+    ctx.lineWidth = s.super ? 4 : 2;
+    ctx.beginPath();
+    ctx.arc(x, s.y, s.r, 0, Math.PI*2);
+    ctx.stroke();
+    // заполненный круг поменьше
+    ctx.fillStyle = `rgba(255, 235, 120, ${alpha * 0.35})`;
+    ctx.beginPath();
+    ctx.arc(x, s.y, s.r * 0.7, 0, Math.PI*2);
+    ctx.fill();
+    // яркое ядро
+    if (s.super){
+      ctx.fillStyle = `rgba(255, 255, 200, ${alpha * 0.6})`;
+      ctx.beginPath();
+      ctx.arc(x, s.y, s.r * 0.3, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+function drawSplatters(){
+  for (const s of peeSplatters){
+    const x = s.x - camX;
+    if (x + s.w < 0 || x > W) continue;
+    const alpha = Math.min(1, s.life / 60);
+    // лужа — плоский эллипс с неровными краями
+    ctx.fillStyle = `rgba(200, 170, 30, ${alpha * 0.8})`;
+    ctx.beginPath();
+    ctx.ellipse(x + s.w/2, s.y + 3, s.w/2, 5, 0, 0, Math.PI*2);
+    ctx.fill();
+    // блик
+    ctx.fillStyle = `rgba(255, 230, 100, ${alpha * 0.5})`;
+    ctx.beginPath();
+    ctx.ellipse(x + s.w/2, s.y + 2, s.w/2 * 0.7, 2, 0, 0, Math.PI*2);
+    ctx.fill();
+    // пузырьки (пульсация)
+    if (Math.floor(Date.now()/100) % 2 === 0){
+      for (let i = 0; i < 4; i++){
+        const bx = x + (s.w / 5) * (i+0.5);
+        ctx.fillStyle = `rgba(255, 255, 180, ${alpha * 0.7})`;
+        ctx.beginPath();
+        ctx.arc(bx, s.y + 2, 1.5, 0, Math.PI*2);
+        ctx.fill();
+      }
+    }
+  }
+}
+
+function drawBeer(b){
+  if (b.taken) return;
+  const x = b.x - camX;
+  if (x < -30 || x > W+30) return;
+  const by = b.y + Math.sin(b.bob)*2;
+
+  // Силуэт: длинное горлышко → плечи → прямое тело
+  // Размер 22x40 px (увеличен с 20x26)
+  // Базовая точка — левый-верх bounding box. Центр по X: x+11
+  const cx = x + 11;
+
+  // тень на земле
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(cx, by+42, 10, 3, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // --- Горлышко (верхняя треть, узкое) ---
+  // янтарное стекло - градиент
+  const neckG = ctx.createLinearGradient(cx-4, by, cx+4, by);
+  neckG.addColorStop(0, '#6A3A10');
+  neckG.addColorStop(0.5, '#C8701A');
+  neckG.addColorStop(1, '#6A3A10');
+  ctx.fillStyle = neckG;
+  ctx.fillRect(cx-3, by+4, 6, 10);
+
+  // --- Плечи (переход с горлышка на тело, трапеция) ---
+  ctx.fillStyle = neckG;
+  ctx.beginPath();
+  ctx.moveTo(cx-3, by+14);
+  ctx.lineTo(cx-9, by+19);
+  ctx.lineTo(cx+9, by+19);
+  ctx.lineTo(cx+3, by+14);
+  ctx.closePath();
+  ctx.fill();
+
+  // --- Тело (широкое, прямое) ---
+  const bodyG = ctx.createLinearGradient(cx-9, by, cx+9, by);
+  bodyG.addColorStop(0, '#5A2F0A');
+  bodyG.addColorStop(0.3, '#B8661A');
+  bodyG.addColorStop(0.5, '#E89030');
+  bodyG.addColorStop(0.7, '#B8661A');
+  bodyG.addColorStop(1, '#5A2F0A');
+  ctx.fillStyle = bodyG;
+  ctx.fillRect(cx-9, by+19, 18, 21);
+
+  // --- Крышка/фольга (жёлтая) ---
+  ctx.fillStyle = '#FFD400';
+  ctx.fillRect(cx-3, by, 6, 4);
+  // верхняя каёмка крышки — темнее
+  ctx.fillStyle = '#C8A000';
+  ctx.fillRect(cx-3, by, 6, 1);
+  // обжим фольги на горлышке
+  ctx.fillStyle = '#E8C200';
+  ctx.fillRect(cx-3, by+3, 6, 2);
+
+  // --- Этикетка ---
+  // Плашка на теле бутылки (по центру)
+  const labelY = by + 22;
+  const labelH = 14;
+  // Фоновая синяя окантовка этикетки (по краям)
+  if (b.nonAlco){
+    // у безалкогольной чуть тусклее синий
+    ctx.fillStyle = '#2A4A80';
+  } else {
+    ctx.fillStyle = '#1E4FD6';
+  }
+  ctx.fillRect(cx-9, labelY, 18, 1);
+  ctx.fillRect(cx-9, labelY+labelH-1, 18, 1);
+
+  // основной жёлтый фон этикетки
+  ctx.fillStyle = b.nonAlco ? '#E8C840' : '#FFD400';
+  ctx.fillRect(cx-9, labelY+1, 18, labelH-2);
+
+  // тёмные горизонтальные полосы на этикетке (имитация надписи)
+  ctx.fillStyle = b.nonAlco ? '#4A3A10' : '#5A2F0A';
+  ctx.fillRect(cx-7, labelY+3, 14, 1);
+  ctx.fillRect(cx-7, labelY+5, 14, 1);
+  // крупная надпись (двухрядная, выглядит как название)
+  ctx.fillRect(cx-7, labelY+7, 14, 2);
+
+  // --- Фигурка рака в нижней части этикетки (только у обычной) ---
+  if (!b.nonAlco){
+    // Силуэт рака: красноватый овал с клешнями
+    ctx.fillStyle = '#A02020';
+    // тело рака (овал)
+    ctx.beginPath();
+    ctx.ellipse(cx, labelY+11, 4, 2, 0, 0, Math.PI*2);
+    ctx.fill();
+    // клешни (две палочки сверху)
+    ctx.fillRect(cx-4, labelY+10, 2, 1);
+    ctx.fillRect(cx+2, labelY+10, 2, 1);
+    // хвост
+    ctx.fillStyle = '#802020';
+    ctx.fillRect(cx-1, labelY+12, 2, 1);
+  }
+  // у безалкогольной вместо рака — тусклое пустое место того же размера
+  // (игрок должен присмотреться, чтобы заметить)
+
+  // --- Блик на бутылке (вертикальный) ---
+  ctx.fillStyle = 'rgba(255, 240, 200, 0.5)';
+  ctx.fillRect(cx-7, by+20, 1, 18);
+  ctx.fillStyle = 'rgba(255, 240, 200, 0.25)';
+  ctx.fillRect(cx-6, by+20, 1, 18);
+  // маленький блик на горлышке
+  ctx.fillStyle = 'rgba(255, 240, 200, 0.4)';
+  ctx.fillRect(cx-2, by+5, 1, 8);
+
+  // --- Контур бутылки (тонкий тёмный) ---
+  ctx.strokeStyle = 'rgba(40, 20, 5, 0.6)';
+  ctx.lineWidth = 0.8;
+  ctx.beginPath();
+  // левый контур: сверху вниз
+  ctx.moveTo(cx-3, by);
+  ctx.lineTo(cx-3, by+14);      // горлышко
+  ctx.lineTo(cx-9, by+19);      // плечо
+  ctx.lineTo(cx-9, by+40);      // тело
+  ctx.lineTo(cx+9, by+40);      // дно
+  ctx.lineTo(cx+9, by+19);      // правый бок
+  ctx.lineTo(cx+3, by+14);      // правое плечо
+  ctx.lineTo(cx+3, by);         // правое горлышко
+  ctx.closePath();
+  ctx.stroke();
+}
+
+function drawHUD(){
+  // --- Большая надпись "БЕЗАЛКОГОЛЬНОЕ!" во время блевания ---
+  if (player.pukeTimer > 0){
+    const progress = 1 - player.pukeTimer / player.pukeTotal;
+    // виньетка — экран в красно-зелёных пятнах
+    ctx.fillStyle = `rgba(100, 60, 20, ${0.3 * (1 - progress)})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // пульсация надписи
+    const pulse = 1 + Math.sin(Date.now()/100) * 0.08;
+    const fade = player.pukeTimer < 30 ? player.pukeTimer / 30 : 1;
+
+    ctx.save();
+    ctx.translate(W/2, H/2 - 40);
+    ctx.scale(pulse, pulse);
+
+    // тёмная подложка
+    ctx.fillStyle = `rgba(0,0,0,${0.75 * fade})`;
+    ctx.fillRect(-280, -50, 560, 80);
+    ctx.strokeStyle = `rgba(255, 80, 80, ${fade})`;
+    ctx.lineWidth = 4;
+    ctx.strokeRect(-280, -50, 560, 80);
+
+    // сам текст жёлтый с обводкой
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 56px Arial';
+    ctx.strokeStyle = `rgba(0,0,0,${fade})`;
+    ctx.lineWidth = 6;
+    ctx.strokeText('БЕЗАЛКОГОЛЬНОЕ!', 0, 10);
+    ctx.fillStyle = `rgba(255, 212, 0, ${fade})`;
+    ctx.fillText('БЕЗАЛКОГОЛЬНОЕ!', 0, 10);
+
+    ctx.restore();
+    ctx.textAlign = 'left';
+  }
+
+  // сердечки
+  for (let i=0;i<player.maxHp;i++){
+    const hx = 15 + i*28, hy = 15;
+    ctx.fillStyle = i < player.hp ? '#e11' : '#333';
+    ctx.beginPath();
+    ctx.arc(hx+5, hy+6, 6, 0, Math.PI*2);
+    ctx.arc(hx+15, hy+6, 6, 0, Math.PI*2);
+    ctx.moveTo(hx, hy+8);
+    ctx.lineTo(hx+10, hy+20);
+    ctx.lineTo(hx+20, hy+8);
+    ctx.fill();
+    ctx.strokeStyle = '#800';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // --- Счётчики инвентаря: три строки ---
+
+  // Иконка бутылки — уменьшенная копия силуэта
+  function drawBottleIcon(ix, iy, mode){
+    // mode: 'full' | 'empty' | 'super'
+    // Высота 22px, ширина ~14px
+    const cx = ix + 7;
+    // крышка
+    ctx.fillStyle = '#FFD400';
+    ctx.fillRect(cx-2, iy, 4, 2);
+    // горлышко
+    ctx.fillStyle = mode === 'empty' ? 'rgba(184,102,26,0.4)' : (mode === 'super' ? '#C8A000' : '#A0521A');
+    ctx.fillRect(cx-2, iy+2, 4, 5);
+    // плечи (трапеция)
+    ctx.beginPath();
+    ctx.moveTo(cx-2, iy+7);
+    ctx.lineTo(cx-5, iy+9);
+    ctx.lineTo(cx+5, iy+9);
+    ctx.lineTo(cx+2, iy+7);
+    ctx.closePath();
+    ctx.fill();
+    // тело
+    if (mode === 'super'){
+      ctx.fillStyle = '#FFD400';
+    } else if (mode === 'empty'){
+      ctx.fillStyle = 'rgba(184,102,26,0.35)';
+    } else {
+      ctx.fillStyle = '#B8661A';
+    }
+    ctx.fillRect(cx-5, iy+9, 10, 11);
+    // этикетка
+    ctx.fillStyle = mode === 'super' ? '#1E4FD6' : (mode === 'empty' ? 'rgba(255,212,0,0.4)' : '#FFD400');
+    ctx.fillRect(cx-5, iy+12, 10, 5);
+    // контур
+    ctx.strokeStyle = 'rgba(40,20,5,0.7)';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(cx-2, iy);
+    ctx.lineTo(cx-2, iy+7);
+    ctx.lineTo(cx-5, iy+9);
+    ctx.lineTo(cx-5, iy+20);
+    ctx.lineTo(cx+5, iy+20);
+    ctx.lineTo(cx+5, iy+9);
+    ctx.lineTo(cx+2, iy+7);
+    ctx.lineTo(cx+2, iy);
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  // 1. Полные бутылки пива
+  const row1y = 42;
+  drawBottleIcon(18, row1y, 'full');
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 16px Arial';
+  ctx.fillText('× ' + player.fullBeers, 35, row1y+17);
+  ctx.font = '10px Arial';
+  ctx.fillStyle = '#8FE680';
+  ctx.fillText('ПОЛНЫЕ [E]', 70, row1y+17);
+
+  // 2. Пустые бутылки
+  const row2y = 68;
+  drawBottleIcon(18, row2y, 'empty');
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 16px Arial';
+  ctx.fillText('× ' + player.emptyBottles, 35, row2y+17);
+  ctx.font = '10px Arial';
+  ctx.fillStyle = '#AAA';
+  ctx.fillText('ПУСТЫЕ [Q/F]', 70, row2y+17);
+
+  // 3. Супер-бутылки
+  const row3y = 94;
+  drawBottleIcon(18, row3y, 'super');
+  if (player.superBottles > 0){
+    ctx.strokeStyle = `rgba(255, 230, 100, ${0.5 + Math.sin(Date.now()/200)*0.3})`;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(16, row3y-2, 18, 26);
+  }
+  ctx.fillStyle = '#FFD400';
+  ctx.font = 'bold 16px Arial';
+  ctx.fillText('× ' + player.superBottles, 35, row3y+17);
+  ctx.font = '10px Arial';
+  ctx.fillStyle = '#FFD400';
+  ctx.fillText('СУПЕР [T]', 70, row3y+17);
+
+  // прогресс-бар
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(W-220, 15, 200, 14);
+  const pg = ctx.createLinearGradient(W-220, 0, W-20, 0);
+  pg.addColorStop(0, '#FFD400');
+  pg.addColorStop(1, '#FFA000');
+  ctx.fillStyle = pg;
+  ctx.fillRect(W-220, 15, 200 * (player.x/LEVEL_WIDTH), 14);
+  ctx.strokeStyle = '#fff';
+  ctx.strokeRect(W-220, 15, 200, 14);
+
+  // финишный флаг
+  const fx = LEVEL_WIDTH - 60 - camX;
+  if (fx < W && fx > -50){
+    ctx.fillStyle = '#8A8A8A';
+    ctx.fillRect(fx, GROUND_Y-140, 3, 140);
+    ctx.fillStyle = '#FFD400';
+    ctx.fillRect(fx+3, GROUND_Y-140, 36, 22);
+    ctx.fillStyle = '#1E4FD6';
+    ctx.fillRect(fx+3, GROUND_Y-118, 36, 22);
+    ctx.fillStyle = '#FFF';
+    ctx.font = 'bold 10px Arial';
+    ctx.fillText('FIN', fx+14, GROUND_Y-105);
+  }
+
+  // --- Бар струи внизу экрана ---
+  // Рисуем пустой контур вместимости и заполненные сегменты (по порциям от каждой бутылки)
+  const barX = 20;
+  const barY = H - 22;
+  const barW = W - 40;
+  const barH = 14;
+
+  // фон бара
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  ctx.fillRect(barX - 2, barY - 2, barW + 4, barH + 4);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.fillRect(barX, barY, barW, barH);
+
+  // заполнение: каждый сегмент = порция от одной бутылки (PEE_PER_BEER_FRAMES кадров)
+  // визуальная длина сегмента пропорциональна его объёму относительно peeTankMax
+  if (player.peeTank > 0){
+    // рисуем сегменты слева направо
+    // segments: массив меток — каждая метка = сколько кадров было ДО добавления этой порции
+    // реально расходуется "верх" стека (последняя добавленная порция тратится первой)
+    // но для простоты визуализации покажем их слева направо как слои
+    let drawn = 0;
+    // строим пороговые значения «снизу» стека
+    const thresholds = [...player.peeSegments, player.peeTank];
+    // thresholds задают границы сегментов: [0, s1, s2, ..., peeTank]
+    const bounds = [0, ...player.peeSegments.filter(s => s < player.peeTank), player.peeTank];
+    // удаляем дубликаты и сортируем
+    const uniq = [...new Set(bounds)].sort((a,b) => a-b);
+
+    for (let i = 0; i < uniq.length - 1; i++){
+      const start = uniq[i];
+      const end = uniq[i+1];
+      const x0 = barX + (start / player.peeTankMax) * barW;
+      const w0 = ((end - start) / player.peeTankMax) * barW;
+      // чередующиеся оттенки жёлтого, чтобы сегменты различались
+      const lit = i % 2 === 0 ? '#FFD400' : '#FFAA00';
+      const g = ctx.createLinearGradient(0, barY, 0, barY + barH);
+      g.addColorStop(0, lit);
+      g.addColorStop(1, i % 2 === 0 ? '#C8A000' : '#C87000');
+      ctx.fillStyle = g;
+      ctx.fillRect(x0, barY, w0, barH);
+      // разделитель
+      if (i < uniq.length - 2){
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillRect(x0 + w0 - 1, barY, 2, barH);
+      }
+    }
+    // мигание когда льётся
+    if (player.peeing){
+      ctx.fillStyle = `rgba(255, 255, 180, ${0.3 + Math.sin(Date.now()/60)*0.2})`;
+      ctx.fillRect(barX, barY, (player.peeTank / player.peeTankMax) * barW, barH);
+    }
+  }
+
+  // рамка
+  ctx.strokeStyle = '#FFD400';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(barX, barY, barW, barH);
+
+  // подпись и счётчик секунд
+  ctx.fillStyle = '#FFF';
+  ctx.font = 'bold 11px Arial';
+  ctx.textAlign = 'left';
+  const seconds = (player.peeTank / 60).toFixed(1);
+  ctx.fillText('СТРУЯ [S]: ' + seconds + ' сек', barX + 4, barY - 4);
+
+  // --- Большая предупреждающая надпись при блевании ---
+  if (player.pukeTimer > 0){
+    const t = player.pukeTimer / player.pukeTotal;
+    const alpha = Math.min(1, t * 2); // яркая в начале, затухает к концу
+    const shake = Math.sin(Date.now()/50) * 6;
+    // полупрозрачный жёлтый фон
+    ctx.fillStyle = `rgba(255, 200, 0, ${alpha * 0.15})`;
+    ctx.fillRect(0, H/2 - 60, W, 120);
+    // тень для текста
+    ctx.fillStyle = `rgba(0, 0, 0, ${alpha * 0.8})`;
+    ctx.font = 'bold 72px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('БЕЗАЛКОГОЛЬНОЕ!', W/2 + shake + 4, H/2 + 4);
+    // основной жёлтый текст
+    ctx.fillStyle = `rgba(255, 220, 0, ${alpha})`;
+    ctx.fillText('БЕЗАЛКОГОЛЬНОЕ!', W/2 + shake, H/2);
+    // нижняя подпись
+    ctx.fillStyle = `rgba(255, 80, 80, ${alpha})`;
+    ctx.font = 'bold 22px Arial';
+    ctx.fillText('−1 HP, блевание ' + (player.pukeTimer/60).toFixed(1) + ' сек', W/2, H/2 + 50);
+    ctx.textAlign = 'left';
+  }
+
+  // --- Экран конца игры (поверх всего) ---
+  if (player.dead){
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0,0,W,H);
+    const win = player.x > LEVEL_WIDTH - 100;
+    ctx.fillStyle = win ? '#FFD400' : '#e11';
+    ctx.font = 'bold 54px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText(win ? 'ПОБЕДА!' : 'ПОРАЖЕНИЕ', W/2, H/2);
+    ctx.fillStyle = '#fff';
+    ctx.font = '20px Arial';
+    ctx.fillText('Нажмите R для рестарта', W/2, H/2+40);
+    ctx.textAlign = 'left';
+  }
+}
+
+let msgTimer = 0;
+function flashMsg(t){ msgEl.textContent = t; msgTimer = 120; }
+
+function reset(){
+  if (player.peeSound){ sndPeeStop(player.peeSound); player.peeSound = null; }
+  player.x = 80; player.y = GROUND_Y - 64;
+  player.vx = 0; player.vy = 0;
+  player.hp = player.maxHp;
+  player.fullBeers = 0;
+  player.emptyBottles = 0;
+  player.superBottles = 0;
+  player.peeTank = 0;
+  player.peeSegments = [];
+  player.scarfLift = 0;
+  player.fillingTimer = 0;
+  player.pukeTimer = 0;
+  player.dead = false;
+  player.invuln = 0;
+  player.attackTimer = 0;
+  player.peeing = false;
+  pee.length = 0;
+  bottles.length = 0;
+  splashes.length = 0;
+  peeSplatters.length = 0;
+  enemies.length = 0;
+  [400, 700, 950, 1200, 1450, 1700, 2000, 2300, 2600, 2900, 3200, 3500, 3800, 4100, 4400].forEach((x,i)=>{
+    spawnEnemy(x, i%2===0 ? 'baton' : 'shield');
+  });
+  for (const b of beers) b.taken = false;
+}
+
+function loop(){
+  if (keys['KeyR']) reset();
+
+  if (!player.dead){
+    updatePlayer();
+    updateEnemies();
+    updateBeers();
+    updatePee();
+    updateBottles();
+    updateSplashes();
+    updateSplatters();
+  }
+
+  drawBackground();
+  drawPlatforms();
+  drawSplatters();
+  for (const b of beers) drawBeer(b);
+  for (const e of enemies) if (e.alive) drawEnemy(e);
+  drawFan();
+  drawPeeStream();
+  drawPee();
+  drawBottles();
+  drawSplashes();
+  drawHUD();
+
+  if (msgTimer > 0){ msgTimer--; if (msgTimer === 0) msgEl.textContent=''; }
+
+  requestAnimationFrame(loop);
+}
+loop();
+
+// Фоновая музыка — шаг каждые 200мс (~BPM 150, 1/8 нота)
+setInterval(() => {
+  if (SFX.started) playMusicStep();
+}, 200);
+</script>
+</body>
+</html>
